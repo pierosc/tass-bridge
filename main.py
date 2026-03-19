@@ -47,6 +47,7 @@ class CreateEventRequest(BaseModel):
     timezone: Optional[str] = None
     attendees: List[EventAttendee] = []
     send_updates: str = "all"  # all | externalOnly | none
+    create_meet: bool = False
 
 
 class UpdateEventRequest(BaseModel):
@@ -183,6 +184,13 @@ def build_event_body_from_create(payload: CreateEventRequest) -> Dict[str, Any]:
             for a in payload.attendees
         ]
 
+    if payload.create_meet:
+        body["conferenceData"] = {
+            "createRequest": {
+                "requestId": secrets.token_urlsafe(12)
+            }
+        }
+
     return body
 
 
@@ -253,7 +261,7 @@ def handle_google_http_error(e: HttpError):
         error_text = e.content.decode("utf-8") if e.content else str(e)
     except Exception:
         error_text = str(e)
-        
+
     print("[Bridge] Google HttpError status =", status)
     print("[Bridge] Google HttpError body =", error_text)
 
@@ -356,12 +364,15 @@ def create_event(
         print("[Bridge] calendarId =", payload.calendar_id)
         print("[Bridge] Google event body =", body)
 
-        created = service.events().insert(
-            calendarId=payload.calendar_id,
-            body=body,
-            conferenceDataVersion=1,
-            sendUpdates=payload.send_updates,
-        ).execute()
+        insert_args = {
+            "calendarId": payload.calendar_id,
+            "body": body,
+            "sendUpdates": payload.send_updates,
+        }
+        if payload.create_meet:
+            insert_args["conferenceDataVersion"] = 1
+
+        created = service.events().insert(**insert_args).execute()
 
         print("[Bridge] Google created event =", created)
 
