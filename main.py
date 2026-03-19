@@ -253,6 +253,9 @@ def handle_google_http_error(e: HttpError):
         error_text = e.content.decode("utf-8") if e.content else str(e)
     except Exception:
         error_text = str(e)
+        
+    print("[Bridge] Google HttpError status =", status)
+    print("[Bridge] Google HttpError body =", error_text)
 
     raise HTTPException(
         status_code=status,
@@ -345,8 +348,13 @@ def create_event(
     require_api_key(x_api_key)
 
     try:
+        print("[Bridge] /events payload =", payload.model_dump())
+
         service = get_calendar_service()
         body = build_event_body_from_create(payload)
+
+        print("[Bridge] calendarId =", payload.calendar_id)
+        print("[Bridge] Google event body =", body)
 
         created = service.events().insert(
             calendarId=payload.calendar_id,
@@ -355,6 +363,8 @@ def create_event(
             sendUpdates=payload.send_updates,
         ).execute()
 
+        print("[Bridge] Google created event =", created)
+
         return normalize_event_response(created)
 
     except HttpError as e:
@@ -362,6 +372,7 @@ def create_event(
     except HTTPException:
         raise
     except Exception as e:
+        print("[Bridge] Unexpected error creating event =", str(e))
         raise HTTPException(status_code=500, detail=f"Unexpected error creating event: {str(e)}")
 
 
