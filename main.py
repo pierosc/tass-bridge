@@ -506,7 +506,55 @@ def freebusy(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error on freebusy query: {str(e)}")
 
+@app.get("/blocks")
+def list_blocks(
+    calendar_id: str = "primary",
+    time_min: Optional[str] = None,
+    time_max: Optional[str] = None,
+    page_token: Optional[str] = None,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    require_api_key(x_api_key)
 
+    try:
+        service = get_calendar_service()
+
+        args = {
+            "calendarId": calendar_id,
+            "singleEvents": True,
+            "orderBy": "startTime",
+            "showDeleted": True,
+            "maxResults": 250,
+        }
+
+        if time_min:
+            args["timeMin"] = time_min
+        if time_max:
+            args["timeMax"] = time_max
+        if page_token:
+            args["pageToken"] = page_token
+
+        result = service.events().list(**args).execute()
+
+        items = []
+        for e in result.get("items", []):
+            summary = (e.get("summary") or "").strip()
+            if summary.upper().startswith("BLOCK |"):
+                items.append(normalize_event_response(e))
+
+        return {
+            "items": items,
+            "nextPageToken": result.get("nextPageToken"),
+            "nextSyncToken": result.get("nextSyncToken"),
+        }
+
+    except HttpError as e:
+        handle_google_http_error(e)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error listing blocks: {str(e)}")
+    
 if __name__ == "__main__":
     import uvicorn
 
