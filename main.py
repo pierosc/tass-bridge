@@ -1,7 +1,10 @@
 import os
 import secrets
+import smtplib
+import base64
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 from typing import List, Optional, Dict, Any
+from email.message import EmailMessage
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, Header
@@ -16,9 +19,12 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
-app = FastAPI(title="TASS Calendar Bridge")
+app = FastAPI(title="TASS Google Bridge")
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -26,6 +32,15 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 BASE_URL = os.getenv("BASE_URL", "")
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
+SMTP_HOST = os.getenv("EMAIL_SMTP_HOST", os.getenv("SMTP_HOST", ""))
+SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", os.getenv("SMTP_PORT", "587")))
+SMTP_USERNAME = os.getenv("EMAIL_SMTP_USERNAME", os.getenv("SMTP_USERNAME", ""))
+SMTP_PASSWORD = os.getenv("EMAIL_SMTP_PASSWORD", os.getenv("SMTP_PASSWORD", ""))
+SMTP_FROM_EMAIL = os.getenv("EMAIL_FROM", os.getenv("SMTP_FROM_EMAIL", ""))
+SMTP_FROM_NAME = os.getenv("EMAIL_FROM_NAME", os.getenv("SMTP_FROM_NAME", "Tax Seguro"))
+SMTP_USE_TLS = os.getenv("EMAIL_SMTP_USE_TLS", os.getenv("SMTP_USE_TLS", "true")).lower() != "false"
+EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "gmail").lower()
+GOOGLE_SENDER_EMAIL = os.getenv("GOOGLE_SENDER_EMAIL", SMTP_FROM_EMAIL)
 
 
 # =========================
@@ -70,6 +85,15 @@ class FreeBusyRequest(BaseModel):
     time_max: str
     time_zone: str = "UTC"
     calendars: List[FreeBusyCalendarItem]
+
+
+class SendEmailRequest(BaseModel):
+    to_email: str = Field(..., min_length=3)
+    subject: str = Field(..., min_length=1)
+    body: str = Field(..., min_length=1)
+    from_email: Optional[str] = None
+    from_name: Optional[str] = None
+    html: Optional[str] = None
 
 
 # =========================
@@ -155,6 +179,99 @@ def get_credentials() -> Credentials:
 def get_calendar_service():
     creds = get_credentials()
     return build("calendar", "v3", credentials=creds)
+
+
+def get_gmail_service():
+    creds = get_credentials()
+    return build("gmail", "v1", credentials=creds)
+
+
+def require_email_env():
+    missing = []
+
+    if not SMTP_HOST:
+        missing.append("EMAIL_SMTP_HOST")
+    if not SMTP_USERNAME:
+        missing.append("EMAIL_SMTP_USERNAME")
+    if not SMTP_PASSWORD:
+        missing.append("EMAIL_SMTP_PASSWORD")
+    if not SMTP_FROM_EMAIL:
+        missing.append("EMAIL_FROM")
+
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing email env vars: {missing}"
+        )
+
+
+def send_smtp_email(payload: SendEmailRequest) -> Dict[str, Any]:
+    require_email_env()
+
+    from_email = payload.from_email or SMTP_FROM_EMAIL
+    from_name = payload.from_name or SMTP_FROM_NAME
+    message_id = f"<{secrets.token_urlsafe(24)}@tass-bridge.local>"
+
+    msg = EmailMessage()
+    msg["Subject"] = payload.subject
+    msg["From"] = f"{from_name} <{from_email}>" if from_name else from_email
+    msg["To"] = payload.to_email
+    msg["Message-ID"] = message_id
+    msg.set_content(payload.body)
+
+    if payload.html:
+        msg.add_alternative(payload.html, subtype="html")
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+        if SMTP_USE_TLS:
+            smtp.starttls()
+        smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+        smtp.send_message(msg)
+
+    return {
+        "ok": True,
+        "provider": "SMTP",
+        "messageId": message_id,
+        "toEmail": payload.to_email,
+        "fromEmail": from_email,
+    }
+
+
+def send_gmail_email(payload: SendEmailRequest) -> Dict[str, Any]:
+    service = get_gmail_service()
+    from_email = payload.from_email or GOOGLE_SENDER_EMAIL or "me"
+    from_name = payload.from_name or SMTP_FROM_NAME
+
+    msg = EmailMessage()
+    msg["Subject"] = payload.subject
+    msg["From"] = f"{from_name} <{from_email}>" if from_name and from_email != "me" else from_email
+    msg["To"] = payload.to_email
+    msg.set_content(payload.body)
+
+    if payload.html:
+        msg.add_alternative(payload.html, subtype="html")
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    sent = service.users().messages().send(
+        userId="me",
+        body={"raw": raw},
+    ).execute()
+
+    return {
+        "ok": True,
+        "provider": "GMAIL",
+        "messageId": sent.get("id"),
+        "threadId": sent.get("threadId"),
+        "toEmail": payload.to_email,
+        "fromEmail": from_email,
+    }
+
+
+def send_email_message(payload: SendEmailRequest) -> Dict[str, Any]:
+    if EMAIL_PROVIDER == "smtp":
+        return send_smtp_email(payload)
+
+    return send_gmail_email(payload)
 
 
 def build_event_body_from_create(payload: CreateEventRequest) -> Dict[str, Any]:
@@ -292,15 +409,15 @@ def health():
 @app.get("/privacy")
 def privacy():
     return {
-        "service": "TASS Calendar Bridge",
-        "privacy": "This service accesses Google Calendar only to create and manage events authorized by the account owner."
+        "service": "TASS Google Bridge",
+        "privacy": "This service accesses Google Calendar to manage events and Gmail to send emails authorized by the account owner."
     }
 
 
 @app.get("/terms")
 def terms():
     return {
-        "service": "TASS Calendar Bridge",
+        "service": "TASS Google Bridge",
         "terms": "Use of this service is restricted to authorized internal TASS workflows."
     }
 
@@ -336,7 +453,7 @@ def oauth_callback(request: Request):
     return JSONResponse(
         {
             "ok": True,
-            "message": "Copy this refresh_token and save it as GOOGLE_REFRESH_TOKEN in Render.",
+            "message": "Copy this refresh_token and save it as GOOGLE_REFRESH_TOKEN in your bridge env vars.",
             "refresh_token": creds.refresh_token,
             "has_refresh_token": bool(creds.refresh_token),
             "scopes": list(creds.scopes) if creds.scopes else [],
@@ -505,6 +622,25 @@ def freebusy(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error on freebusy query: {str(e)}")
+
+
+@app.post("/emails/send")
+def send_email(
+    payload: SendEmailRequest,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    require_api_key(x_api_key)
+
+    try:
+        print("[Bridge] /emails/send to =", payload.to_email)
+        return send_email_message(payload)
+    except HttpError as e:
+        handle_google_http_error(e)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("[Bridge] Unexpected error sending email =", str(e))
+        raise HTTPException(status_code=500, detail=f"Unexpected error sending email: {str(e)}")
 
 @app.get("/blocks")
 def list_blocks(
