@@ -59,6 +59,7 @@ class CreateEventRequest(BaseModel):
     description: str = ""
     location: str = ""
     calendar_id: str = "primary"
+    calendar_name: Optional[str] = None
     timezone: Optional[str] = None
     attendees: List[EventAttendee] = []
     send_updates: str = "all"  # all | externalOnly | none
@@ -71,9 +72,11 @@ class UpdateEventRequest(BaseModel):
     end_iso: Optional[str] = None
     description: Optional[str] = None
     location: Optional[str] = None
+    calendar_name: Optional[str] = None
     timezone: Optional[str] = None
     attendees: Optional[List[EventAttendee]] = None
     send_updates: str = "all"  # all | externalOnly | none
+    create_meet: bool = False
 
 
 class FreeBusyCalendarItem(BaseModel):
@@ -186,6 +189,66 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
+def normalize_calendar_summary(value: Optional[str]) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def clean_calendar_summary(value: Optional[str]) -> Optional[str]:
+    cleaned = " ".join(str(value or "").split()).strip()
+    return cleaned or None
+
+
+def get_or_create_calendar_id(service, calendar_name: str) -> str:
+    desired_summary = clean_calendar_summary(calendar_name)
+    if not desired_summary:
+        return "primary"
+
+    desired_key = normalize_calendar_summary(desired_summary)
+    page_token = None
+
+    while True:
+        args = {
+            "maxResults": 250,
+            "minAccessRole": "writer",
+            "showHidden": True,
+        }
+        if page_token:
+            args["pageToken"] = page_token
+
+        result = service.calendarList().list(**args).execute()
+
+        for calendar in result.get("items", []):
+            if normalize_calendar_summary(calendar.get("summary")) == desired_key:
+                calendar_id = calendar.get("id")
+                if calendar_id:
+                    return calendar_id
+
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
+
+    created = service.calendars().insert(
+        body={
+            "summary": desired_summary,
+        }
+    ).execute()
+
+    created_id = created.get("id")
+    if not created_id:
+        raise HTTPException(status_code=500, detail="Google created a calendar without returning an id.")
+
+    return created_id
+
+
+def resolve_event_calendar_id(service, calendar_id: Optional[str], calendar_name: Optional[str]) -> str:
+    cleaned_calendar_name = clean_calendar_summary(calendar_name)
+    if cleaned_calendar_name:
+        return get_or_create_calendar_id(service, cleaned_calendar_name)
+
+    cleaned_calendar_id = clean_calendar_summary(calendar_id)
+    return cleaned_calendar_id or "primary"
+
+
 def require_email_env():
     missing = []
 
@@ -281,11 +344,6 @@ def build_event_body_from_create(payload: CreateEventRequest) -> Dict[str, Any]:
         "location": payload.location,
         "start": {"dateTime": payload.start_iso},
         "end": {"dateTime": payload.end_iso},
-        "conferenceData": {
-            "createRequest": {
-                "requestId": secrets.token_urlsafe(12)
-            }
-        },
     }
 
     if payload.timezone:
@@ -355,7 +413,7 @@ def extract_meet_link(event: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def normalize_event_response(event: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_event_response(event: Dict[str, Any], calendar_id: Optional[str] = None) -> Dict[str, Any]:
     return {
         "eventId": event.get("id"),
         "status": event.get("status"),
@@ -366,7 +424,7 @@ def normalize_event_response(event: Dict[str, Any]) -> Dict[str, Any]:
         "meetLink": extract_meet_link(event),
         "start": event.get("start"),
         "end": event.get("end"),
-        "calendarId": event.get("organizer", {}).get("email"),
+        "calendarId": calendar_id or event.get("organizer", {}).get("email"),
         "attendees": event.get("attendees", []),
     }
 
@@ -476,13 +534,19 @@ def create_event(
         print("[Bridge] /events payload =", payload.model_dump())
 
         service = get_calendar_service()
+        calendar_id = resolve_event_calendar_id(
+            service,
+            payload.calendar_id,
+            payload.calendar_name,
+        )
         body = build_event_body_from_create(payload)
 
-        print("[Bridge] calendarId =", payload.calendar_id)
+        print("[Bridge] calendarName =", payload.calendar_name)
+        print("[Bridge] calendarId =", calendar_id)
         print("[Bridge] Google event body =", body)
 
         insert_args = {
-            "calendarId": payload.calendar_id,
+            "calendarId": calendar_id,
             "body": body,
             "sendUpdates": payload.send_updates,
         }
@@ -493,7 +557,7 @@ def create_event(
 
         print("[Bridge] Google created event =", created)
 
-        return normalize_event_response(created)
+        return normalize_event_response(created, calendar_id)
 
     except HttpError as e:
         handle_google_http_error(e)
@@ -519,7 +583,7 @@ def get_event(
             eventId=event_id,
         ).execute()
 
-        return normalize_event_response(event)
+        return normalize_event_response(event, calendar_id)
 
     except HttpError as e:
         handle_google_http_error(e)
@@ -540,21 +604,39 @@ def update_event(
 
     try:
         service = get_calendar_service()
+        source_calendar_id = clean_calendar_summary(calendar_id) or "primary"
+        target_calendar_id = resolve_event_calendar_id(
+            service,
+            source_calendar_id,
+            payload.calendar_name,
+        )
         body = build_event_body_from_update(payload)
+        moved = None
+
+        if target_calendar_id != source_calendar_id:
+            moved = service.events().move(
+                calendarId=source_calendar_id,
+                eventId=event_id,
+                destination=target_calendar_id,
+                sendUpdates=payload.send_updates,
+            ).execute()
+            event_id = moved.get("id") or event_id
 
         if not body:
+            if moved is not None:
+                return normalize_event_response(moved, target_calendar_id)
             raise HTTPException(status_code=400, detail="No fields provided to update.")
 
         # Si cambia fecha/hora sin Meet aún, mantenemos o pedimos conferenceDataVersion
         updated = service.events().patch(
-            calendarId=calendar_id,
+            calendarId=target_calendar_id,
             eventId=event_id,
             body=body,
             conferenceDataVersion=1,
             sendUpdates=payload.send_updates,
         ).execute()
 
-        return normalize_event_response(updated)
+        return normalize_event_response(updated, target_calendar_id)
 
     except HttpError as e:
         handle_google_http_error(e)
@@ -676,7 +758,7 @@ def list_blocks(
         for e in result.get("items", []):
             summary = (e.get("summary") or "").strip()
             if summary.upper().startswith("BLOCK |"):
-                items.append(normalize_event_response(e))
+                items.append(normalize_event_response(e, calendar_id))
 
         return {
             "items": items,
