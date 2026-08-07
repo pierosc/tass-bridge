@@ -2,6 +2,7 @@ import os
 import secrets
 import smtplib
 import base64
+from datetime import datetime, timezone
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 from typing import List, Optional, Dict, Any
 from email.message import EmailMessage
@@ -97,6 +98,11 @@ class SendEmailRequest(BaseModel):
     from_email: Optional[str] = None
     from_name: Optional[str] = None
     html: Optional[str] = None
+
+
+class CalendarColorUpdateRequest(BaseModel):
+    calendar_name: str = Field(..., min_length=1)
+    background_color: str = Field(..., min_length=7, max_length=7)
 
 
 # =========================
@@ -196,6 +202,38 @@ def normalize_calendar_summary(value: Optional[str]) -> str:
 def clean_calendar_summary(value: Optional[str]) -> Optional[str]:
     cleaned = " ".join(str(value or "").split()).strip()
     return cleaned or None
+
+
+def normalize_hex_color(value: Optional[str]) -> str:
+    color = str(value or "").strip().upper()
+    if len(color) != 7 or not color.startswith("#"):
+        raise HTTPException(status_code=400, detail="Color must use #RRGGBB format.")
+    try:
+        int(color[1:], 16)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Color must use #RRGGBB format.")
+    return color
+
+
+def foreground_for_background(background_color: str) -> str:
+    color = normalize_hex_color(background_color)
+    red = int(color[1:3], 16)
+    green = int(color[3:5], 16)
+    blue = int(color[5:7], 16)
+    luminance = (0.299 * red + 0.587 * green + 0.114 * blue) / 255
+    return "#000000" if luminance > 0.55 else "#FFFFFF"
+
+
+def set_calendar_color(service, calendar_id: str, background_color: str) -> Dict[str, Any]:
+    color = normalize_hex_color(background_color)
+    return service.calendarList().patch(
+        calendarId=calendar_id,
+        colorRgbFormat=True,
+        body={
+            "backgroundColor": color,
+            "foregroundColor": foreground_for_background(color),
+        },
+    ).execute()
 
 
 def get_or_create_calendar_id(service, calendar_name: str) -> str:
@@ -462,6 +500,96 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/health/google-calendar")
+def google_calendar_health(x_api_key: Optional[str] = Header(default=None)):
+    require_api_key(x_api_key)
+
+    try:
+        service = get_calendar_service()
+        calendar = service.calendars().get(calendarId="primary").execute()
+        return {
+            "ok": True,
+            "calendarId": calendar.get("id", "primary"),
+            "calendarName": calendar.get("summary"),
+            "checkedAt": datetime.now(timezone.utc).isoformat(),
+        }
+    except HTTPException:
+        raise
+    except HttpError as e:
+        handle_google_http_error(e)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to Google Calendar: {str(e)}",
+        )
+
+
+@app.get("/calendars/colors")
+def list_calendar_colors(x_api_key: Optional[str] = Header(default=None)):
+    require_api_key(x_api_key)
+
+    try:
+        service = get_calendar_service()
+        items = []
+        page_token = None
+        while True:
+            args = {
+                "maxResults": 250,
+                "minAccessRole": "writer",
+                "showHidden": True,
+            }
+            if page_token:
+                args["pageToken"] = page_token
+
+            result = service.calendarList().list(**args).execute()
+            for calendar in result.get("items", []):
+                items.append({
+                    "calendarId": calendar.get("id"),
+                    "calendarName": calendar.get("summary"),
+                    "backgroundColor": calendar.get("backgroundColor"),
+                })
+
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+
+        return {"items": items}
+    except HTTPException:
+        raise
+    except HttpError as e:
+        handle_google_http_error(e)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to list calendar colors: {str(e)}")
+
+
+@app.put("/calendars/color")
+def update_calendar_color(
+    payload: CalendarColorUpdateRequest,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    require_api_key(x_api_key)
+
+    try:
+        service = get_calendar_service()
+        calendar_name = clean_calendar_summary(payload.calendar_name)
+        if not calendar_name:
+            raise HTTPException(status_code=400, detail="calendar_name is required.")
+
+        calendar_id = get_or_create_calendar_id(service, calendar_name)
+        updated = set_calendar_color(service, calendar_id, payload.background_color)
+        return {
+            "calendarId": calendar_id,
+            "calendarName": updated.get("summary") or calendar_name,
+            "backgroundColor": updated.get("backgroundColor") or normalize_hex_color(payload.background_color),
+        }
+    except HTTPException:
+        raise
+    except HttpError as e:
+        handle_google_http_error(e)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to update calendar color: {str(e)}")
 
 
 @app.get("/privacy")
